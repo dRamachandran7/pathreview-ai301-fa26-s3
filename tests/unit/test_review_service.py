@@ -1,14 +1,24 @@
 """Tests for review_service.py"""
 
+from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 import pytest
+from fastapi.testclient import TestClient
 
+import core.services.review_service as review_service
+from api.main import app
+from api.middleware.auth import get_current_user
+from core.database import get_db
 from core.services.review_service import (
+    compute_profile_content_hash,
     create_review,
+    get_or_create_review,
     get_review,
     list_reviews,
+    process_review,
 )
 
 
@@ -377,3 +387,149 @@ class TestReviewService:
 
         # Should order by created_at descending
         mock_db_session.execute.assert_called_once()
+
+
+def _profile(**overrides):
+    fields = {
+        "id": str(uuid4()),
+        "github_username": "octocat",
+        "portfolio_url": "https://example.test/portfolio",
+        "resume_text": "Resume text",
+        "resume_filename": "resume.pdf",
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _result(value):
+    """Synchronous stand-in for a SQLAlchemy result: result.scalars().first()."""
+    result = Mock()
+    result.scalars.return_value.first.return_value = value
+    return result
+
+
+@pytest.mark.unit
+class TestReviewContentHashCache:
+    """Tests for reusing completed reviews when profile content is unchanged (#9)."""
+
+    @pytest.fixture
+    def db(self):
+        session = AsyncMock()
+        session.add = Mock()
+        return session
+
+    def test_hash_is_stable_for_identical_profile_content(self):
+        assert compute_profile_content_hash(_profile()) == compute_profile_content_hash(_profile())
+
+    @pytest.mark.parametrize(
+        "field", ["github_username", "portfolio_url", "resume_text", "resume_filename"]
+    )
+    def test_hash_changes_when_any_reviewed_field_changes(self, field):
+        original = _profile()
+        changed = _profile(**{field: "changed"})
+        assert compute_profile_content_hash(original) != compute_profile_content_hash(changed)
+
+    def test_hash_distinguishes_missing_from_empty(self):
+        assert compute_profile_content_hash(
+            _profile(resume_text=None)
+        ) != compute_profile_content_hash(_profile(resume_text=""))
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_returns_cached_review_on_hit(self, db):
+        profile = _profile()
+        cached = SimpleNamespace(id=uuid4(), status="complete")
+        db.execute = AsyncMock(side_effect=[_result(profile), _result(cached)])
+
+        review, is_cached = await get_or_create_review(db, profile.id, uuid4())
+
+        assert review is cached
+        assert is_cached is True
+        db.add.assert_not_called()
+        db.commit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_creates_pending_review_on_miss(self, db):
+        profile = _profile()
+        db.execute = AsyncMock(side_effect=[_result(profile), _result(None)])
+
+        review, is_cached = await get_or_create_review(db, profile.id, uuid4())
+
+        assert is_cached is False
+        assert review.status == "pending"
+        assert review.content_hash is None
+        db.add.assert_called_once_with(review)
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_creates_review_when_profile_missing(self, db):
+        db.execute = AsyncMock(return_value=_result(None))
+
+        review, is_cached = await get_or_create_review(db, uuid4(), uuid4())
+
+        assert is_cached is False
+        assert review.status == "pending"
+        db.execute.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_process_review_stores_content_hash_on_completion(self, db):
+        profile = _profile()
+        review = SimpleNamespace(id=uuid4(), status="pending", content_hash=None)
+        db.execute = AsyncMock(side_effect=[_result(review), _result(profile)])
+
+        await process_review(db, review.id, profile.id)
+
+        assert review.status == "complete"
+        assert review.content_hash == compute_profile_content_hash(profile)
+
+    @pytest.mark.asyncio
+    async def test_process_review_leaves_hash_unset_when_safety_checks_fail(self, db):
+        profile = _profile()
+        review = SimpleNamespace(id=uuid4(), status="pending", content_hash=None)
+        db.execute = AsyncMock(side_effect=[_result(review), _result(profile)])
+
+        with patch.object(review_service, "_run_safety_checks", AsyncMock(return_value=False)):
+            await process_review(db, review.id, profile.id)
+
+        assert review.status == "failed"
+        assert review.content_hash is None
+
+
+@pytest.mark.unit
+class TestCreateReviewEndpointCache:
+    """POST /reviews only schedules the pipeline on a cache miss (#9)."""
+
+    @pytest.fixture
+    def client(self):
+        app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id=uuid4())
+        app.dependency_overrides[get_db] = lambda: AsyncMock()
+        yield TestClient(app)
+        app.dependency_overrides.clear()
+
+    def _review(self, status):
+        now = datetime.utcnow()
+        return SimpleNamespace(
+            id=uuid4(),
+            profile_id=uuid4(),
+            status=status,
+            sections=None,
+            overall_score=None,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+        )
+
+    @pytest.mark.parametrize(("cached", "expected_calls"), [(True, 0), (False, 1)])
+    def test_pipeline_scheduled_only_on_miss(self, client, cached, expected_calls):
+        review = self._review("complete" if cached else "pending")
+        with (
+            patch(
+                "api.routes.reviews.get_or_create_review",
+                AsyncMock(return_value=(review, cached)),
+            ),
+            patch("api.routes.reviews.process_review", AsyncMock()) as mock_process,
+        ):
+            response = client.post("/reviews", json={"profile_id": str(review.profile_id)})
+
+        assert response.status_code == 200
+        assert response.json()["id"] == str(review.id)
+        assert response.json()["status"] == review.status
+        assert mock_process.call_count == expected_calls

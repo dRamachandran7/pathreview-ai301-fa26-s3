@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import datetime
 from uuid import UUID
@@ -31,6 +32,75 @@ async def create_review(
     await db.commit()
     await db.refresh(review)
     return review
+
+
+def compute_profile_content_hash(profile: Profile) -> str:
+    """Compute a SHA256 hash of the profile fields the review pipeline reads.
+
+    Any change to these fields produces a different hash, so it can be used
+    to tell whether a completed review is still current for the profile.
+
+    Args:
+        profile: Profile whose github_username, portfolio_url, resume_text,
+            and resume_filename are hashed.
+
+    Returns:
+        The 64-character hex digest of the hashed fields.
+    """
+    content = {
+        "github_username": profile.github_username,
+        "portfolio_url": profile.portfolio_url,
+        "resume_text": profile.resume_text,
+        "resume_filename": profile.resume_filename,
+    }
+    payload = json.dumps(content, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+async def get_or_create_review(
+    db,
+    profile_id: UUID,
+    user_id: UUID,
+) -> tuple[Review, bool]:
+    """Return a completed review for unchanged profile content, or create a new one.
+
+    Looks up the most recent completed review of the profile whose content
+    hash matches the profile's current content. If there is none, or the
+    profile doesn't exist, a new pending review is created.
+
+    Args:
+        db: Async database session.
+        profile_id: ID of the profile to review.
+        user_id: ID of the user requesting the review.
+
+    Returns:
+        A (review, cached) tuple. cached is True when review is an existing
+        completed review, in which case the pipeline does not need to run.
+    """
+    stmt = select(Profile).where(Profile.id == profile_id)
+    result = await db.execute(stmt)
+    profile = result.scalars().first()
+
+    if profile:
+        content_hash = compute_profile_content_hash(profile)
+        stmt = (
+            select(Review)
+            .where(
+                and_(
+                    Review.profile_id == profile_id,
+                    Review.content_hash == content_hash,
+                    Review.status == "complete",
+                )
+            )
+            .order_by(Review.updated_at.desc())
+        )
+        result = await db.execute(stmt)
+        cached_review = result.scalars().first()
+        if cached_review:
+            return cached_review, True
+
+    review = await create_review(db, profile_id, user_id)
+    return review, False
 
 
 async def get_review(
@@ -169,6 +239,7 @@ async def process_review(
         review.status = "complete"
         review.sections = [s.model_dump() for s in sections]
         review.overall_score = rag_output.get("overall_score", None)
+        review.content_hash = compute_profile_content_hash(profile)
         review.updated_at = datetime.utcnow()
 
         db.add(review)
